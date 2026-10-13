@@ -155,7 +155,7 @@ public partial class Beasts
             return false;
         }
 
-        dynamic controller = await getController("Beasts", TimeSpan.FromMilliseconds(500));
+        object controller = await getController("Beasts", TimeSpan.FromMilliseconds(500));
         if (controller == null)
         {
             HudLog.Fault("InputHumanizer busy -- another plugin holds the input lock; trying again next pass.", "humanizer-busy");
@@ -164,16 +164,47 @@ public partial class Beasts
 
         try
         {
-            controller.KeyDown(Keys.ControlKey);
-            await controller.Click(clickPos);
-            await controller.KeyUp(Keys.ControlKey, true);
+            var link = HumanizerLinkFor(controller.GetType());
+            if (link == null)
+            {
+                Settings.Automation.Enable.Value = false;
+                return false;
+            }
+            link.KeyDown(controller, Keys.ControlKey);
+            await link.Click(controller, clickPos);
+            await link.KeyUp(controller, Keys.ControlKey, true);
         }
         finally
         {
-            controller.Dispose();
+            (controller as IDisposable)?.Dispose();
         }
 
         return true;
+    }
+
+    private InputHumanizerLink _humanizerLink;
+    private Type _humanizerBrokenType;
+    private string _humanizerBroken;
+
+    /// <summary>
+    /// The bound calls for this controller type: bound once, again only when InputHumanizer hands out a different
+    /// type (reloaded or updated). A type that doesn't fit is named on screen every time automation tries it.
+    /// </summary>
+    private InputHumanizerLink HumanizerLinkFor(Type controllerType)
+    {
+        if (_humanizerLink?.ControllerType == controllerType) return _humanizerLink;
+        if (_humanizerBrokenType != controllerType)
+        {
+            _humanizerLink = InputHumanizerLink.Bind(controllerType, out _humanizerBroken);
+            _humanizerBrokenType = _humanizerLink == null ? controllerType : null;
+            if (_humanizerLink != null)
+            {
+                HudLog.Quiet($"[Humanizer] bound KeyDown/Click/KeyUp on {controllerType.FullName}");
+                return _humanizerLink;
+            }
+        }
+        HudLog.Fault($"InputHumanizer's controller doesn't fit ({_humanizerBroken}) -- automation stopped; switch to simple input or update InputHumanizer.", "humanizer-signature");
+        return null;
     }
 
     // ── Main automation loop ──────────────────────────────────────────────────
