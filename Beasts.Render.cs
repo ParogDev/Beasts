@@ -4,12 +4,8 @@ using System.Diagnostics;
 using System.Globalization;
 using System.Linq;
 using Beasts.Data;
-using Beasts.ExileCore;
 using ExileCore.PoEMemory.Components;
 using ExileCore.PoEMemory.Elements;
-// Alias resolves the ambiguity: both namespaces expose a CapturedBeast type.
-// We need our custom one (has DisplayName, ItemizeButton, ReleaseButton).
-using BestiaryBeast = Beasts.ExileCore.CapturedBeast;
 using ExileCore.PoEMemory.Elements.InventoryElements;
 using ExileCore.Shared;
 using ExileCore.Shared.Enums;
@@ -40,7 +36,7 @@ public partial class Beasts
     // and share the result across all draw methods and the automation task.
 
     private record CachedBeastEntry(
-        BestiaryBeast Element,
+        CapturedBeast Element,
         string DisplayName,
         float Price,
         bool IsGenericYellow,
@@ -50,8 +46,25 @@ public partial class Beasts
     private readonly Stopwatch _beastCacheTimer = Stopwatch.StartNew();
     private bool _bestiaryVisible;
     private SharpDX.RectangleF _cachedPanelRect;
-    private HashSet<string> _selectedBeastPathsSet = new(StringComparer.Ordinal);
+    private readonly HashSet<string> _selectedBeastPathsSet = new(StringComparer.Ordinal);
     private const int BeastCacheMs = 250;
+    private const int SelectedPathsRefreshMs = 250;
+
+    // ── Per-frame render snapshot ─────────────────────────────────────────────
+    // Built in Tick() so Render() never calls GetComponent or ToWorldWithTerrainHeight.
+    // Value-type snapshot -- no stale-entity risk between Tick and Render.
+    private readonly record struct BeastRenderSnapshot(
+        long EntityId,
+        Vector2 GridPos,
+        Vector3 WorldPos,
+        string DisplayName,
+        Color FillColor,
+        Color OutlineColor,
+        Color TextColor,
+        bool IsYellow,
+        bool IsSelected);
+
+    private readonly List<BeastRenderSnapshot> _renderSnapshots = new(32);
 
     // ── Automation status ─────────────────────────────────────────────────────
     private enum AutomationStatus { Idle, InProgress, Completed }
@@ -69,16 +82,7 @@ public partial class Beasts
 
     public override void Render()
     {
-        // Rebuild the selected-beast path set unconditionally so DrawBeastsWindow,
-        // DrawInGameBeasts and DrawBeastsOnMap always have up-to-date data regardless
-        // of which other features are enabled.
-        if (_beastCacheTimer.ElapsedMilliseconds >= BeastCacheMs)
-        {
-            _selectedBeastPathsSet = Settings.Beasts
-                .Select(b => b.Path)
-                .Where(p => !string.IsNullOrEmpty(p))
-                .ToHashSet(StringComparer.Ordinal);
-        }
+        // _selectedBeastPathsSet is now rebuilt in Tick() -- no LINQ in Render.
 
         // Only rebuild the full bestiary panel cache (expensive UI traversal) when at
         // least one feature that needs it is active AND the left panel is open.
@@ -92,8 +96,24 @@ public partial class Beasts
             _beastCacheTimer.Restart();
         }
 
-        DrawInGameBeasts();
-        if (Settings.ShowBeastPricesOnLargeMap.Value) DrawBeastsOnLargeMap();
+        // Scoped occlusion guards -- in-world draws skip when a blocking UI is open
+        // or during spawn immunity. Panel overlays (bestiary, inventory, stash) and
+        // the tracker window intentionally do NOT gate on this -- they need their
+        // respective panels to be visible.
+        var ingameUi = GameController.Game.IngameState.IngameUi;
+        var uiOcclusion =
+            ingameUi.FullscreenPanels.Any(x => x.IsVisible) ||
+            ingameUi.LargePanels.Any(x => x.IsVisible);
+        var sidePanelOpen =
+            ingameUi.OpenLeftPanel.IsVisible ||
+            ingameUi.OpenRightPanel.IsVisible;
+        var canDrawInWorld = !uiOcclusion && !sidePanelOpen && !_playerInGracePeriod;
+
+        if (canDrawInWorld) DrawInGameBeasts();
+        // Large map overlay draws onto the map widget itself, which is visible
+        // alongside the side panels -- so it only gates on uiOcclusion, not on
+        // sidePanelOpen or grace period.
+        if (Settings.ShowBeastPricesOnLargeMap.Value && !uiOcclusion) DrawBeastsOnLargeMap();
         if (Settings.ShowBestiaryPanel.Value) DrawBestiaryPanel();
         if (Settings.ShowAllPricesInBestiaryPanel.Value) DrawBestiaryPrices();
         if (Settings.ShowBestiaryDebug.Value) DrawBestiaryDebug();
@@ -150,13 +170,13 @@ public partial class Beasts
         var ingameUi = GameController.IngameState.IngameUi;
 
         // Fast pre-check: if the left panel isn't open at all, the bestiary can't
-        // be visible — skip the expensive 6-level UI traversal entirely.
+        // be visible -- skip the expensive UI traversal entirely.
         if (!ingameUi.OpenLeftPanel.IsVisible) return;
 
-        var bestiary = ingameUi.GetBestiaryPanel();
+        var bestiary = ingameUi.ChallengesPanel?.TabContainer?.BestiaryTab;
         if (bestiary == null || !bestiary.IsVisible) return;
 
-        var cbp = bestiary.CapturedBeastsPanel;
+        var cbp = bestiary.CapturedBeastsTab;
         if (cbp == null || !cbp.IsVisible) return;
 
         _bestiaryVisible = true;
@@ -166,7 +186,7 @@ public partial class Beasts
         {
             try
             {
-                var name = beast.DisplayName;
+                var name = beast.Name?.Replace("-", "").Trim();
                 if (string.IsNullOrEmpty(name)) continue;
 
                 var isGenericYellow = !Settings.BeastPrices.TryGetValue(name, out var price);
@@ -223,56 +243,46 @@ public partial class Beasts
         var playerHeight = -playerRender.RenderStruct.Height;
         var heightData = GameController.IngameState.Data.RawTerrainHeightData;
 
-        foreach (var trackedBeast in _trackedBeasts)
+        for (int i = 0; i < _renderSnapshots.Count; i++)
         {
-            var entity = trackedBeast.Value;
-            var positioned = entity.GetComponent<Positioned>();
-            if (positioned == null) continue;
+            var snap = _renderSnapshots[i];
+            if (!snap.IsYellow && !snap.IsSelected) continue;
 
-            if (!BeastByPath.TryGetValue(entity.Metadata ?? "", out var beast)) continue;
-            if (!_selectedBeastPathsSet.Contains(beast.Path)) continue;
+            var mapPos = EntityToMapPos(snap.GridPos, playerPosition, playerHeight, heightData, mapCenter);
 
-            var mapPos = EntityToMapPos(positioned, playerPosition, playerHeight, heightData, mapCenter);
+            string text;
+            Color textColor;
 
-            if (Settings.BeastPrices.TryGetValue(beast.DisplayName, out var price) && price > 0)
+            if (snap.IsYellow)
             {
-                var text = $"{price.ToString(CultureInfo.InvariantCulture)}c";
-                var textSize = Graphics.MeasureText(text);
-                var textOffset = textSize / 2f;
-                DrawBox(mapPos - textOffset - new Vector2(4, 2), mapPos + textOffset + new Vector2(4, 2), new Color(0, 0, 0, 180));
-                DrawText(text, mapPos - textOffset, GetSpecialBeastColor(beast.DisplayName));
+                text = snap.DisplayName;
+                textColor = new Color(255, 250, 0);
             }
-        }
+            else
+            {
+                if (!Settings.BeastPrices.TryGetValue(snap.DisplayName, out var price) || price <= 0) continue;
+                text = $"{price.ToString(CultureInfo.InvariantCulture)}c";
+                textColor = snap.OutlineColor;
+            }
 
-        foreach (var trackedYellow in _trackedYellowBeasts)
-        {
-            var entity = trackedYellow.Value;
-            var positioned = entity.GetComponent<Positioned>();
-            if (positioned == null) continue;
-
-            var mapPos = EntityToMapPos(positioned, playerPosition, playerHeight, heightData, mapCenter);
-            var renderName = entity.GetComponent<Render>()?.Name ?? "Yellow Beast";
-            var textSize = Graphics.MeasureText(renderName);
+            var textSize = Graphics.MeasureText(text);
             var textOffset = textSize / 2f;
             DrawBox(mapPos - textOffset - new Vector2(4, 2), mapPos + textOffset + new Vector2(4, 2), new Color(0, 0, 0, 180));
-            DrawText(renderName, mapPos - textOffset, new Color(255, 250, 0));
+            DrawText(text, mapPos - textOffset, textColor);
         }
     }
 
-    private Vector2 EntityToMapPos(Positioned positioned, Vector2 playerPosition, float playerHeight,
+    private Vector2 EntityToMapPos(Vector2 gridPos, Vector2 playerPosition, float playerHeight,
         float[][] heightData, Vector2 mapCenter)
     {
-        var beastPosition = new Vector2(positioned.GridPosNum.X, positioned.GridPosNum.Y);
-        var beastGridPos = positioned.GridPosNum;
-
         float beastHeight = 0;
-        var beastX = (int)beastGridPos.X;
-        var beastY = (int)beastGridPos.Y;
+        var beastX = (int)gridPos.X;
+        var beastY = (int)gridPos.Y;
         if (heightData != null && beastY >= 0 && beastY < heightData.Length
             && beastX >= 0 && beastX < heightData[beastY].Length)
             beastHeight = heightData[beastY][beastX];
 
-        return mapCenter + TranslateGridDeltaToMapDelta(beastPosition - playerPosition, playerHeight + beastHeight);
+        return mapCenter + TranslateGridDeltaToMapDelta(gridPos - playerPosition, playerHeight + beastHeight);
     }
 
     private Vector2 TranslateGridDeltaToMapDelta(Vector2 delta, float deltaZ)
@@ -300,33 +310,23 @@ public partial class Beasts
 
     private void DrawInGameBeasts()
     {
-        foreach (var trackedBeast in _trackedBeasts)
+        var camera = GameController.IngameState.Camera;
+
+        for (int i = 0; i < _renderSnapshots.Count; i++)
         {
-            var entity = trackedBeast.Value;
-            var positioned = entity.GetComponent<Positioned>();
-            if (positioned == null) continue;
+            var snap = _renderSnapshots[i];
+            if (!snap.IsSelected) continue;
 
-            // O(1) dict lookup instead of O(n) FirstOrDefault
-            if (!BeastByPath.TryGetValue(entity.Metadata ?? "", out var beast)) continue;
-            if (!_selectedBeastPathsSet.Contains(beast.Path)) continue;
+            // Built-in safe circle helpers -- handle frustum edge cases correctly.
+            // Two-layer pattern preserves the original 20% fill + full-alpha outline look.
+            Graphics.DrawFilledCircleInWorld(snap.WorldPos, 100f, snap.FillColor);
+            Graphics.DrawCircleInWorld(snap.WorldPos, 100f, snap.OutlineColor, 2f, 24, false);
 
-            var pos = GameController.IngameState.Data.ToWorldWithTerrainHeight(positioned.GridPosition);
-            Graphics.DrawText(beast.DisplayName, GameController.IngameState.Camera.WorldToScreen(pos),
-                Color.White, FontAlign.Center);
-            DrawFilledCircleInWorldPosition(pos, 100, GetSpecialBeastColor(beast.DisplayName));
-        }
+            // Text: gate on WorldToScreen == Vector2.Zero (ExileCore's off-screen sentinel).
+            var screenPos = camera.WorldToScreen(snap.WorldPos);
+            if (screenPos == Vector2.Zero) continue;
 
-        foreach (var trackedYellow in _trackedYellowBeasts)
-        {
-            var entity = trackedYellow.Value;
-            var positioned = entity.GetComponent<Positioned>();
-            if (positioned == null) continue;
-
-            var renderName = entity.GetComponent<Render>()?.Name ?? "Yellow Beast";
-            var pos = GameController.IngameState.Data.ToWorldWithTerrainHeight(positioned.GridPosition);
-            Graphics.DrawText(renderName, GameController.IngameState.Camera.WorldToScreen(pos),
-                new Color(255, 250, 0), FontAlign.Center);
-            DrawFilledCircleInWorldPosition(pos, 100, new Color(255, 250, 0));
+            Graphics.DrawText(snap.DisplayName, screenPos, snap.TextColor, FontAlign.Center);
         }
     }
 
@@ -406,7 +406,7 @@ public partial class Beasts
 
     // ── Debug window ──────────────────────────────────────────────────────────
 
-    private static readonly string DebugOutputPath = @"C:\Users\bruno\Documents\Codex\Bridge\bestiary_debug.txt";
+    private static readonly string DebugOutputPath = System.IO.Path.Combine(System.IO.Path.GetTempPath(), "bestiary_debug.txt");
     private DateTime _lastDebugWrite = DateTime.MinValue;
 
     private void DrawBestiaryDebug()
@@ -419,52 +419,18 @@ public partial class Beasts
         var sb = new System.Text.StringBuilder();
         sb.AppendLine($"=== Bestiary Debug {DateTime.Now:HH:mm:ss} ===");
 
-        var raw = ui.GetChildAtIndex(50)
-            ?.GetChildAtIndex(2)
-            ?.GetChildAtIndex(0)
-            ?.GetChildAtIndex(1)
-            ?.GetChildAtIndex(1);
+        var challengesPanel = ui.ChallengesPanel;
+        var cpLine = $"ChallengesPanel null={challengesPanel == null}  vis={challengesPanel?.IsVisible}";
+        ImGui.Text(cpLine); sb.AppendLine(cpLine);
 
-        var rawLine = $"[50][2][0][1][1] null={raw == null}  cc={raw?.ChildCount ?? -1}";
-        ImGui.Text(rawLine); sb.AppendLine(rawLine);
-
-        if (raw != null)
-        {
-            for (var i = 0; i < Math.Min(raw.ChildCount, 30); i++)
-            {
-                var ch = raw.GetChildAtIndex(i);
-                var line = $"  [{i}] vis={ch?.IsVisible}  cc={ch?.ChildCount ?? -1}  txt=\"{ch?.Text ?? ""}\"";
-                ImGui.Text(line); sb.AppendLine(line);
-                if (ch != null && ch.IsVisible && ch.ChildCount > 0)
-                {
-                    for (var j = 0; j < Math.Min(ch.ChildCount, 25); j++)
-                    {
-                        var gc = ch.GetChildAtIndex(j);
-                        sb.AppendLine($"    [{i}][{j}] vis={gc?.IsVisible}  cc={gc?.ChildCount ?? -1}  txt=\"{gc?.Text ?? ""}\"");
-                        if (gc != null && gc.IsVisible && gc.ChildCount > 0 && gc.ChildCount <= 20)
-                        {
-                            for (var k = 0; k < Math.Min(gc.ChildCount, 10); k++)
-                            {
-                                var ggc = gc.GetChildAtIndex(k);
-                                sb.AppendLine($"      [{i}][{j}][{k}] vis={ggc?.IsVisible}  cc={ggc?.ChildCount ?? -1}  txt=\"{ggc?.Text ?? ""}\"");
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        ImGui.Separator();
-        sb.AppendLine("---");
-
-        var bestiary = ui.GetBestiaryPanel();
-        var bLine = $"BestiaryPanel null={bestiary == null}  vis={bestiary?.IsVisible}  addr={bestiary?.Address}";
+        var bestiary = challengesPanel?.TabContainer?.BestiaryTab;
+        var bLine = $"BestiaryTab null={bestiary == null}  vis={bestiary?.IsVisible}  addr={bestiary?.Address}";
         ImGui.Text(bLine); sb.AppendLine(bLine);
 
-        global::Beasts.ExileCore.CapturedBeastsPanel? cbp = null;
-        try { cbp = bestiary?.CapturedBeastsPanel; }
-        catch (Exception ex) { ImGui.Text($"CapturedBeastsPanel threw: {ex.Message}"); sb.AppendLine($"CapturedBeastsPanel threw: {ex.Message}"); }
-        var cbpLine = $"CapturedBeastsPanel null={cbp == null}  vis={cbp?.IsVisible}  addr={cbp?.Address}";
+        CapturedBeastsTab cbp = null;
+        try { cbp = bestiary?.CapturedBeastsTab; }
+        catch (Exception ex) { ImGui.Text($"CapturedBeastsTab threw: {ex.Message}"); sb.AppendLine($"CapturedBeastsTab threw: {ex.Message}"); }
+        var cbpLine = $"CapturedBeastsTab null={cbp == null}  vis={cbp?.IsVisible}  addr={cbp?.Address}";
         ImGui.Text(cbpLine); sb.AppendLine(cbpLine);
 
         // Use cached data — avoids re-reading 660 beast names per debug frame
@@ -548,15 +514,16 @@ public partial class Beasts
                     ImGui.Text(craft);
             }
 
-            foreach (var trackedYellow in _trackedYellowBeasts)
+            for (int i = 0; i < _renderSnapshots.Count; i++)
             {
-                var entity = trackedYellow.Value;
-                var renderName = entity.GetComponent<Render>()?.Name ?? "Yellow Beast";
+                var snap = _renderSnapshots[i];
+                if (!snap.IsYellow) continue;
+
                 ImGui.TableNextRow();
                 ImGui.TableNextColumn();
                 ImGui.TextColored(new System.Numerics.Vector4(1f, 0.98f, 0f, 1f), "-");
                 ImGui.TableNextColumn();
-                ImGui.TextColored(new System.Numerics.Vector4(1f, 0.98f, 0f, 1f), renderName);
+                ImGui.TextColored(new System.Numerics.Vector4(1f, 0.98f, 0f, 1f), snap.DisplayName);
             }
 
             ImGui.EndTable();
@@ -612,25 +579,69 @@ public partial class Beasts
         }
     }
 
-    // ── Geometry helpers ──────────────────────────────────────────────────────
+    // ── Render snapshot builder ───────────────────────────────────────────────
+    // Called from Tick() so all entity component reads and world-position math
+    // happen outside Render. Value-type snapshot means no stale-entity risk.
 
-    private void DrawFilledCircleInWorldPosition(Vector3 position, float radius, Color color)
+    private void RebuildRenderSnapshots()
     {
-        var circlePoints = new List<Vector2>();
-        const int segments = 15;
-        const float segmentAngle = 2f * MathF.PI / segments;
+        _renderSnapshots.Clear();
 
-        for (var i = 0; i < segments; i++)
+        var terrainData = GameController.IngameState.Data;
+        var fillAlpha = Color.ToByte((int)(0.2f * byte.MaxValue));
+
+        foreach (var kvp in _trackedBeasts)
         {
-            var angle = i * segmentAngle;
-            var currentOffset = new Vector2(MathF.Cos(angle), MathF.Sin(angle)) * radius;
-            var nextOffset = new Vector2(MathF.Cos(angle + segmentAngle), MathF.Sin(angle + segmentAngle)) * radius;
-            circlePoints.Add(GameController.IngameState.Camera.WorldToScreen(position + new Vector3(currentOffset, 0)));
-            circlePoints.Add(GameController.IngameState.Camera.WorldToScreen(position + new Vector3(nextOffset, 0)));
+            var entity = kvp.Value;
+            if (entity == null || !entity.IsValid || !entity.IsAlive) continue;
+
+            var positioned = entity.GetComponent<Positioned>();
+            if (positioned == null) continue;
+
+            if (!BeastByPath.TryGetValue(entity.Metadata ?? "", out var beast)) continue;
+
+            var isSelected = _selectedBeastPathsSet.Contains(beast.Path);
+            var worldPos = terrainData.ToWorldWithTerrainHeight(positioned.GridPosition);
+            var outline = GetSpecialBeastColor(beast.DisplayName);
+            var fill = outline with { A = fillAlpha };
+            var gridPos = new Vector2(positioned.GridPosNum.X, positioned.GridPosNum.Y);
+
+            _renderSnapshots.Add(new BeastRenderSnapshot(
+                kvp.Key,
+                gridPos,
+                worldPos,
+                beast.DisplayName,
+                fill,
+                outline,
+                Color.White,
+                IsYellow: false,
+                IsSelected: isSelected));
         }
 
-        Graphics.DrawConvexPolyFilled(circlePoints.ToArray(),
-            color with { A = Color.ToByte((int)((double)0.2f * byte.MaxValue)) });
-        Graphics.DrawPolyLine(circlePoints.ToArray(), color, 2);
+        foreach (var kvp in _trackedYellowBeasts)
+        {
+            var entity = kvp.Value;
+            if (entity == null || !entity.IsValid || !entity.IsAlive) continue;
+
+            var positioned = entity.GetComponent<Positioned>();
+            if (positioned == null) continue;
+
+            var renderName = entity.GetComponent<Render>()?.Name ?? "Yellow Beast";
+            var worldPos = terrainData.ToWorldWithTerrainHeight(positioned.GridPosition);
+            var yellow = new Color(255, 250, 0);
+            var fill = yellow with { A = fillAlpha };
+            var gridPos = new Vector2(positioned.GridPosNum.X, positioned.GridPosNum.Y);
+
+            _renderSnapshots.Add(new BeastRenderSnapshot(
+                kvp.Key,
+                gridPos,
+                worldPos,
+                renderName,
+                fill,
+                yellow,
+                yellow,
+                IsYellow: true,
+                IsSelected: true));
+        }
     }
 }
