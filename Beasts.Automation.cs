@@ -158,7 +158,7 @@ public partial class Beasts
         dynamic controller = await getController("Beasts", TimeSpan.FromMilliseconds(500));
         if (controller == null)
         {
-            HudLog.Quiet("InputHumanizer busy -- another plugin holds the input lock; trying again next pass.");
+            HudLog.Fault("InputHumanizer busy -- another plugin holds the input lock; trying again next pass.", "humanizer-busy");
             return false;
         }
 
