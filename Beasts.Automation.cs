@@ -150,7 +150,7 @@ public partial class Beasts
 
         if (getController == null)
         {
-            LogError("InputHumanizer plugin not available -- switch to SimpleDelay or enable InputHumanizer.");
+            HudLog.Fault("InputHumanizer plugin not available -- switch to SimpleDelay or enable InputHumanizer.");
             Settings.Automation.Enable.Value = false;
             return false;
         }
@@ -158,7 +158,7 @@ public partial class Beasts
         dynamic controller = await getController("Beasts", TimeSpan.FromMilliseconds(500));
         if (controller == null)
         {
-            LogError("InputHumanizer busy -- another plugin holds the input lock.");
+            HudLog.Fault("InputHumanizer busy -- another plugin holds the input lock.");
             return false;
         }
 
@@ -286,7 +286,7 @@ public partial class Beasts
                     {
                         _nextActionDelayMs = 0;
                         // Cache is already refreshed inside WaitForBeastCountChange.
-                        LogMsg($"[Beast] click={clickMs}ms wtc={wtcMs}ms ping={ping}ms zone={zone} cache={_cachedBeasts.Count} remaining");
+                        HudLog.Quiet($"[Beast] click={clickMs}ms wtc={wtcMs}ms ping={ping}ms zone={zone} cache={_cachedBeasts.Count} remaining");
 
                         // SLOW zone: approaching an itemize target. Pause a few frames
                         // to let the game's input hit-testing catch up with the UI shift
@@ -305,7 +305,7 @@ public partial class Beasts
                     }
                     else
                     {
-                        LogMsg($"[Beast] click={clickMs}ms wtc=TIMEOUT({wtcMs}ms) ping={ping}ms zone={zone} -- applying fallback delay");
+                        HudLog.Quiet($"[Beast] click={clickMs}ms wtc=TIMEOUT({wtcMs}ms) ping={ping}ms zone={zone} -- applying fallback delay");
                         _nextActionDelayMs = Settings.Automation.FallbackDelayMs.Value;
                         return true;
                     }
