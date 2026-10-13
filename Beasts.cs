@@ -18,8 +18,8 @@ public partial class Beasts : BaseSettingsPlugin<BeastsSettings>
 {
     public override void OnClose()
     {
-        HudLog.Flush();
-        base.OnClose();
+        try { HudLog.Flush(); }
+        finally { base.OnClose(); }
     }
 
     private readonly Dictionary<long, Entity> _trackedBeasts = new();

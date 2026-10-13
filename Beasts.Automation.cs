@@ -150,7 +150,7 @@ public partial class Beasts
 
         if (getController == null)
         {
-            HudLog.Fault("InputHumanizer plugin not available -- switch to SimpleDelay or enable InputHumanizer.");
+            HudLog.Fault("InputHumanizer plugin not available -- switch to SimpleDelay or enable InputHumanizer.", "humanizer-missing");
             Settings.Automation.Enable.Value = false;
             return false;
         }
@@ -158,7 +158,7 @@ public partial class Beasts
         dynamic controller = await getController("Beasts", TimeSpan.FromMilliseconds(500));
         if (controller == null)
         {
-            HudLog.Fault("InputHumanizer busy -- another plugin holds the input lock.");
+            HudLog.Quiet("InputHumanizer busy -- another plugin holds the input lock; trying again next pass.");
             return false;
         }
 
