@@ -16,6 +16,12 @@ namespace Beasts;
 
 public partial class Beasts : BaseSettingsPlugin<BeastsSettings>
 {
+    public override void OnClose()
+    {
+        try { HudLog.Flush(); }
+        finally { base.OnClose(); }
+    }
+
     private readonly Dictionary<long, Entity> _trackedBeasts = new();
     private readonly Dictionary<long, Entity> _trackedYellowBeasts = new();
     private int _isFetchingPrices;
@@ -64,7 +70,7 @@ public partial class Beasts : BaseSettingsPlugin<BeastsSettings>
     {
         if (!TryBeginPriceRefresh(forceRefresh)) return;
 
-        DebugWindow.LogMsg("Fetching Beast Prices from PoeNinja...");
+        HudLog.Quiet("Fetching Beast Prices from PoeNinja...");
         try
         {
             var prices = await PoeNinja.GetBeastsPrices();
@@ -77,7 +83,7 @@ public partial class Beasts : BaseSettingsPlugin<BeastsSettings>
         }
         catch (Exception exception)
         {
-            DebugWindow.LogMsg($"Failed to fetch Beast Prices from PoeNinja: {exception.Message}");
+            HudLog.Fault($"Failed to fetch Beast Prices from PoeNinja: {exception.GetType().Name}: {exception.Message}", "poeninja-fetch");
         }
         finally
         {
