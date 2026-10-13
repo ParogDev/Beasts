@@ -55,7 +55,7 @@ public partial class Beasts : BaseSettingsPlugin<BeastsSettings>
         Settings.FetchBeastPrices.OnPressed += () => TriggerPriceRefresh(true);
         TriggerPriceRefresh(true);
 
-        GameController.PluginBridge.SaveMethod("Beasts.IsAllowedBeastNearby", (int range) => IsAllowedBeastNearby(range));
+        BridgeExports.Register(this, GameController.PluginBridge); // [BridgeExport] methods: Beasts.IsAllowedBeastNearby
 
         Input.RegisterKey(Settings.Automation.Hotkey);
         Settings.Automation.Hotkey.OnValueChanged += () => Input.RegisterKey(Settings.Automation.Hotkey);
@@ -222,6 +222,7 @@ public partial class Beasts : BaseSettingsPlugin<BeastsSettings>
         return null;
     }
 
+    [BridgeExport("Beasts.IsAllowedBeastNearby")]
     private bool IsAllowedBeastNearby(int range)
     {
         return GetAllowedBeastsInRange(range).Any();
