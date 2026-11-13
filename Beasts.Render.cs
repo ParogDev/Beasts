@@ -10,7 +10,7 @@ using ExileCore.PoEMemory.Elements.InventoryElements;
 using ExileCore.Shared;
 using ExileCore.Shared.Enums;
 using ExileCore.Shared.Helpers;
-using ImGuiNET;
+using Hexa.NET.ImGui;
 using SharpDX;
 using Vector2 = System.Numerics.Vector2;
 using Vector3 = System.Numerics.Vector3;
