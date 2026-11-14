@@ -7,7 +7,7 @@ using ExileCore.Shared.Attributes;
 using ExileCore.Shared.Helpers;
 using ExileCore.Shared.Interfaces;
 using ExileCore.Shared.Nodes;
-using ImGuiNET;
+using Hexa.NET.ImGui;
 using Newtonsoft.Json;
 using SharpDX;
 
